@@ -1,164 +1,231 @@
-// server.js
-import express from 'express';
-import bodyParser from 'body-parser';
-import fetch from 'node-fetch';
+import express from "express";
+import bodyParser from "body-parser";
+import fetch from "node-fetch";
 
+// -----------------------------
+// 🔧 Express Setup
+// -----------------------------
 const app = express();
 app.use(bodyParser.json());
+app.use(express.json());
 
-// CORS headers for Shopify App Proxy
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', 'https://www.solerevivalandredemption.com');
-  res.setHeader('Content-Type', 'application/json');
-  next();
-});
-
+// -----------------------------
+// 🔧 Shopify API Helpers
+// -----------------------------
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
 const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
-const API_VERSION = '2024-01';
-const NAMESPACE = 'srr_qc';
 
-// ---------- Shopify helpers ----------
-async function shopifyRest(path, method = 'GET', body) {
-  const url = `https://${SHOPIFY_STORE}/admin/api/${API_VERSION}/${path}.json`;
-  const res = await fetch(url, {
-    method,
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN
-    },
-    body: body ? JSON.stringify(body) : undefined
-  });
-  return res.json();
+function shopifyURL(path) {
+  return `https://${SHOPIFY_STORE}/admin/api/2024-01/${path}`;
 }
 
-async function shopifyGraphQL(query, variables = {}) {
-  const res = await fetch(`https://${SHOPIFY_STORE}/admin/api/${API_VERSION}/graphql.json`, {
-    method: 'POST',
+async function shopifyGET(path) {
+  const res = await fetch(shopifyURL(path), {
     headers: {
-      'Content-Type': 'application/json',
-      'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN
-    },
-    body: JSON.stringify({ query, variables })
-  });
-  return res.json();
-}
-
-async function writeMetafield(orderId, key, value, type = 'single_line_text_field') {
-  const gid = `gid://shopify/Order/${orderId}`;
-  const metafields = [{
-    ownerId: gid,
-    namespace: NAMESPACE,
-    key,
-    value: typeof value === 'object' ? JSON.stringify(value) : String(value),
-    type
-  }];
-
-  const query = `
-    mutation SetMetafield($metafields: [MetafieldsSetInput!]!) {
-      metafieldsSet(metafields: $metafields) {
-        metafields { id key value }
-        userErrors { field message }
-      }
+      "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
+      "Content-Type": "application/json"
     }
-  `;
-  return shopifyGraphQL(query, { metafields });
+  });
+  return res.json();
 }
 
+async function shopifyPOST(path, body) {
+  const res = await fetch(shopifyURL(path), {
+    method: "POST",
+    headers: {
+      "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+  return res.json();
+}
+
+async function shopifyPUT(path, body) {
+  const res = await fetch(shopifyURL(path), {
+    method: "PUT",
+    headers: {
+      "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+  return res.json();
+}
+
+// -----------------------------
+// 🔧 Metafield Helpers
+// -----------------------------
 async function getMetafield(orderId, key) {
-  const res = await shopifyRest(`orders/${orderId}/metafields`);
-  const mf = (res.metafields || []).find(m => m.namespace === NAMESPACE && m.key === key);
+  const data = await shopifyGET(`orders/${orderId}/metafields.json`);
+  const mf = data.metafields.find(m => m.key === key);
   return mf ? mf.value : null;
 }
 
-async function validateToken(orderId, token) {
-  const stored = await getMetafield(orderId, 'token');
-  return stored && stored === token;
+async function writeMetafield(orderId, key, value, type = "string") {
+  return shopifyPOST(`orders/${orderId}/metafields.json`, {
+    metafield: {
+      namespace: "srr_qc",
+      key,
+      type,
+      value: typeof value === "object" ? JSON.stringify(value) : value
+    }
+  });
 }
 
 function nowIso() {
   return new Date().toISOString();
 }
 
-// ---------- Endpoints ----------
+// -----------------------------
+// 🔧 Token Validation
+// -----------------------------
+async function validateToken(orderId, token) {
+  const stored = await getMetafield(orderId, "customer_token");
+  return stored && stored === token;
+}
 
-// 1️⃣ GET /apps/srr-qc/order?id=ORDER_ID
-app.get('/apps/srr-qc/order', async (req, res) => {
+// -----------------------------
+// 1️⃣ GET /apps/srr-qc/order
+// -----------------------------
+app.get("/apps/srr-qc/order", async (req, res) => {
   try {
-    const orderId = req.query.id;
-    if (!orderId) return res.status(400).json({ error: 'Missing order id' });
+    const { id, token } = req.query;
 
-    const order = await shopifyRest(`orders/${orderId}`);
-    const metafieldsRes = await shopifyRest(`orders/${orderId}/metafields`);
-    const qc = {};
-    for (const mf of metafieldsRes.metafields || []) {
-      if (mf.namespace === NAMESPACE) {
-        try { qc[mf.key] = JSON.parse(mf.value); } catch { qc[mf.key] = mf.value; }
-      }
+    if (!id || !token) {
+      return res.status(400).json({ error: "Missing id or token" });
     }
 
-    res.json({ order: order.order, qc });
+    if (!(await validateToken(id, token))) {
+      return res.status(401).json({ error: "Invalid token" });
+    }
+
+    const order = await shopifyGET(`orders/${id}.json`);
+    const photos = await getMetafield(id, "customer_photos");
+
+    res.json({
+      order: order.order,
+      photos: photos ? JSON.parse(photos) : []
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("❌ Error in GET /order:", err);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
+// -----------------------------
 // 2️⃣ POST /apps/srr-qc/approve
-app.post('/apps/srr-qc/approve', async (req, res) => {
+// -----------------------------
+app.post("/apps/srr-qc/approve", async (req, res) => {
   try {
-    const { order_id, token } = req.body;
-    if (!order_id || !token) return res.status(400).json({ error: 'Missing fields' });
-    if (!(await validateToken(order_id, token))) return res.status(401).json({ error: 'Invalid token' });
+    const { order_id, token, photo_index } = req.body;
 
-    const timestamp = nowIso();
-    await writeMetafield(order_id, 'approved', 'true');
-    await writeMetafield(order_id, 'approved_at', timestamp);
-    await writeMetafield(order_id, 'timeline', [{ event: 'Customer approved QC photos', timestamp, staff: 'Customer' }], 'json');
-    await writeMetafield(order_id, 'customer_update', { timestamp, action: 'approved', order_id }, 'json');
+    if (!order_id || !token || photo_index === undefined) {
+      return res.status(400).json({ error: "Missing fields" });
+    }
+
+    if (!(await validateToken(order_id, token))) {
+      return res.status(401).json({ error: "Invalid token" });
+    }
+
+    const raw = await getMetafield(order_id, "customer_photos");
+    let photos = raw ? JSON.parse(raw) : [];
+
+    if (!photos[photo_index]) {
+      return res.status(400).json({ error: "Photo index invalid" });
+    }
+
+    photos[photo_index].approved = true;
+
+    await writeMetafield(order_id, "customer_photos", photos, "json");
+    await writeMetafield(
+      order_id,
+      "customer_update",
+      { timestamp: nowIso(), action: "approve_photo", order_id },
+      "json"
+    );
 
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("❌ Error in POST /approve:", err);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
+// -----------------------------
 // 3️⃣ POST /apps/srr-qc/message
-app.post('/apps/srr-qc/message', async (req, res) => {
+// -----------------------------
+app.post("/apps/srr-qc/message", async (req, res) => {
   try {
-    const { order_id, token, text, photo_url } = req.body;
-    if (!order_id || !token || !text) return res.status(400).json({ error: 'Missing fields' });
-    if (!(await validateToken(order_id, token))) return res.status(401).json({ error: 'Invalid token' });
+    const { order_id, token, message } = req.body;
 
-    const timestamp = nowIso();
-    const currentNotesRaw = await getMetafield(order_id, 'notes_customer');
-    let notes = [];
-    try { notes = currentNotesRaw ? JSON.parse(currentNotesRaw) : []; } catch {}
-    notes.push({ text, timestamp, sender: 'customer', type: 'message', photo_url: photo_url || null });
+    if (!order_id || !token || !message) {
+      return res.status(400).json({ error: "Missing fields" });
+    }
 
-    await writeMetafield(order_id, 'notes_customer', notes, 'json');
-    await writeMetafield(order_id, 'customer_update', { timestamp, action: 'message', order_id }, 'json');
+    if (!(await validateToken(order_id, token))) {
+      return res.status(401).json({ error: "Invalid token" });
+    }
+
+    await writeMetafield(
+      order_id,
+      "customer_message",
+      { timestamp: nowIso(), message },
+      "json"
+    );
 
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("❌ Error in POST /message:", err);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
+// -----------------------------
 // 4️⃣ POST /apps/srr-qc/customer-photo
-app.post('/apps/srr-qc/customer-photo', async (req, res) => {
+// -----------------------------
+app.post("/apps/srr-qc/customer-photo", async (req, res) => {
   try {
     const { order_id, token, url, customerName, date } = req.body;
-    if (!order_id || !token || !url || !customerName || !date) return res.status(400).json({ error: 'Missing fields' });
-    if (!(await validateToken(order_id, token))) return res.status(401).json({ error: 'Invalid token' });
 
-    const currentPhotosRaw = await getMetafield(order_id, 'customer_photos');
+    if (!order_id || !token || !url || !customerName || !date) {
+      return res.status(400).json({ error: "Missing fields" });
+    }
+
+    if (!(await validateToken(order_id, token))) {
+      return res.status(401).json({ error: "Invalid token" });
+    }
+
+    const currentPhotosRaw = await getMetafield(order_id, "customer_photos");
     let photos = [];
-    try { photos = currentPhotosRaw ? JSON.parse(currentPhotosRaw) : []; } catch {}
+
+    try {
+      photos = currentPhotosRaw ? JSON.parse(currentPhotosRaw) : [];
+    } catch {
+      photos = [];
+    }
+
     photos.push({ url, customerName, date, approved: false });
 
-    await writeMetafield(order_id, 'customer_photos', photos, 'json');
-    await writeMetafield(order_id, 'customer_update', { timestamp: nowIso(), action: 'kicks_pic', order_id }, 'json');
+    await writeMetafield(order_id, "customer_photos", photos, "json");
+    await writeMetafield(
+      order_id,
+      "customer_update",
+      { timestamp: nowIso(), action: "kicks_pic", order_id },
+      "json"
+    );
 
     res.json({ success: true });
   } catch (err) {
-    res
+    console.error("❌ Error in POST /customer-photo:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// -----------------------------
+// 🔥 REQUIRED FOR RENDER
+// -----------------------------
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🔥 SRR-KKC Proxy running on port ${PORT}`);
+});
