@@ -1,140 +1,120 @@
 import express from "express";
-import bodyParser from "body-parser";
 import fetch from "node-fetch";
 
 const app = express();
-app.use(bodyParser.json());
 app.use(express.json());
 
-const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
-const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
+const SHOP = process.env.SHOPIFY_STORE;
+const TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 const PORT = process.env.PORT || 3000;
 
-async function shopifyGET(path) {
-  const res = await fetch(`https://${SHOPIFY_STORE}/admin/api/2024-01/${path}`, {
-    headers: { "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN, "Content-Type": "application/json" }
+// CORS for storefront
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "https://www.solerevivalandredemption.com");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
+});
+
+async function getOrderMetafields(orderId) {
+  const response = await fetch(
+    `https://${SHOP}/admin/api/2024-01/orders/${orderId}/metafields.json`,
+    { headers: { "X-Shopify-Access-Token": TOKEN } }
+  );
+  const data = await response.json();
+  const qc = {};
+  (data.metafields || []).forEach(m => {
+    if (m.namespace === "srr_qc") qc[m.key] = m.value;
   });
-  return res.json();
+  return qc;
 }
 
-async function shopifyPOST(path, body) {
-  const res = await fetch(`https://${SHOPIFY_STORE}/admin/api/2024-01/${path}`, {
+async function getOrder(orderId) {
+  const response = await fetch(
+    `https://${SHOP}/admin/api/2024-01/orders/${orderId}.json`,
+    { headers: { "X-Shopify-Access-Token": TOKEN } }
+  );
+  const data = await response.json();
+  return data.order;
+}
+
+async function updateMetafield(orderId, key, value) {
+  await fetch(`https://${SHOP}/admin/api/2024-01/orders/${orderId}/metafields.json`, {
     method: "POST",
-    headers: { "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN, "Content-Type": "application/json" },
-    body: JSON.stringify(body)
-  });
-  return res.json();
-}
-
-async function getAllMetafields(orderId) {
-  const data = await shopifyGET(`orders/${orderId}/metafields.json?namespace=srr_qc`);
-  if (!Array.isArray(data?.metafields)) {
-    console.error(`❌ getAllMetafields failed for order ${orderId}:`, JSON.stringify(data));
-    return [];
-  }
-  return data.metafields;
-}
-
-function getMF(metafields, key) {
-  const mf = metafields.find(m => m.key === key);
-  if (!mf) return null;
-  try { return JSON.parse(mf.value); } catch { return mf.value; }
-}
-
-async function writeMetafield(orderId, key, value, type = "single_line_text_field") {
-  return shopifyPOST(`orders/${orderId}/metafields.json`, {
-    metafield: {
-      namespace: "srr_qc", key, type,
-      value: typeof value === "object" ? JSON.stringify(value) : String(value)
-    }
+    headers: {
+      "X-Shopify-Access-Token": TOKEN,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      metafield: {
+        namespace: "srr_qc",
+        key,
+        value: String(value),
+        type: "single_line_text_field"
+      }
+    })
   });
 }
 
-async function validateToken(orderId, token) {
-  const metafields = await getAllMetafields(orderId);
-  const stored = getMF(metafields, "token");
-  return stored && stored === token;
-}
+// GET /order?id=ORDER_ID&token=TOKEN
+app.get("/order", async (req, res) => {
+  const { id, token } = req.query;
+  if (!id || !token) return res.status(400).json({ error: "Missing id or token" });
 
-app.get("/apps/srr-qc/order", async (req, res) => {
   try {
-    const { id, token } = req.query;
-    if (!id || !token) return res.status(400).json({ error: "Missing id or token" });
-
-    const metafields = await getAllMetafields(id);
-    const stored = getMF(metafields, "token");
-    if (!stored || stored !== token) return res.status(401).json({ error: "Invalid token" });
-
-    const orderData = await shopifyGET(`orders/${id}.json?fields=id,name,created_at,line_items`);
+    const [order, qc] = await Promise.all([getOrder(id), getOrderMetafields(id)]);
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    if (qc.token !== token) return res.status(401).json({ error: "Invalid token" });
 
     res.json({
-      order: orderData.order || {},
-      qc: {
-        status:           getMF(metafields, "status")           || "Pending",
-        token:            getMF(metafields, "token"),
-        photos:           getMF(metafields, "photos")           || [],
-        timeline:         getMF(metafields, "timeline")         || [],
-        messages:         getMF(metafields, "messages")         || [],
-        notes_customer:   getMF(metafields, "notes_customer")   || [],
-        approved:         getMF(metafields, "approved") === true || getMF(metafields, "approved") === "true",
-        approved_at:      getMF(metafields, "approved_at")      || null,
-        tracking_number:  getMF(metafields, "tracking_number")  || null,
-        tracking_carrier: getMF(metafields, "tracking_carrier") || null,
-        tracking_notes:   getMF(metafields, "tracking_notes")   || null
-      }
+      order: {
+        id: order.id,
+        name: order.name,
+        created_at: order.created_at,
+        line_items: order.line_items
+      },
+      qc
     });
   } catch (err) {
-    console.error("❌ Error in GET /order:", err);
+    console.error(err);
     res.status(500).json({ error: "Server error" });
   }
 });
 
-app.post("/apps/srr-qc/approve", async (req, res) => {
-  try {
-    const { order_id, token } = req.body;
-    if (!order_id || !token) return res.status(400).json({ error: "Missing fields" });
-    if (!(await validateToken(order_id, token))) return res.status(401).json({ error: "Invalid token" });
-    await writeMetafield(order_id, "approved", "true");
-    await writeMetafield(order_id, "approved_at", new Date().toISOString());
-    res.json({ success: true });
-  } catch (err) {
-    console.error("❌ Error in POST /approve:", err);
-    res.status(500).json({ error: "Server error" });
-  }
+// POST /approve
+app.post("/approve", async (req, res) => {
+  const { order_id, token } = req.body;
+  const qc = await getOrderMetafields(order_id);
+  if (qc.token !== token) return res.status(401).json({ error: "Invalid token" });
+  await updateMetafield(order_id, "approved", "true");
+  await updateMetafield(order_id, "approved_at", new Date().toISOString());
+  await updateMetafield(order_id, "flow_trigger", "approved");
+  res.json({ success: true });
 });
 
-app.post("/apps/srr-qc/message", async (req, res) => {
-  try {
-    const { order_id, token, message, sender } = req.body;
-    if (!order_id || !token || !message) return res.status(400).json({ error: "Missing fields" });
-    if (!(await validateToken(order_id, token))) return res.status(401).json({ error: "Invalid token" });
-    const metafields = await getAllMetafields(order_id);
-    const existing = getMF(metafields, "messages") || [];
-    existing.push({ sender: sender || "customer", message, created_at: new Date().toISOString() });
-    await writeMetafield(order_id, "messages", JSON.stringify(existing), "json");
-    res.json({ success: true });
-  } catch (err) {
-    console.error("❌ Error in POST /message:", err);
-    res.status(500).json({ error: "Server error" });
-  }
+// POST /message
+app.post("/message", async (req, res) => {
+  const { order_id, token, message } = req.body;
+  const qc = await getOrderMetafields(order_id);
+  if (qc.token !== token) return res.status(401).json({ error: "Invalid token" });
+  const messages = JSON.parse(qc.messages || "[]");
+  messages.push({ from: "customer", text: message, timestamp: new Date().toISOString() });
+  await updateMetafield(order_id, "messages", JSON.stringify(messages));
+  await updateMetafield(order_id, "flow_trigger", "customer_message");
+  res.json({ success: true });
 });
 
-app.post("/apps/srr-qc/customer-photo", async (req, res) => {
-  try {
-    const { order_id, token, image, caption } = req.body;
-    if (!order_id || !token || !image) return res.status(400).json({ error: "Missing fields" });
-    if (!(await validateToken(order_id, token))) return res.status(401).json({ error: "Invalid token" });
-    const metafields = await getAllMetafields(order_id);
-    const existing = getMF(metafields, "customer_photos") || [];
-    existing.push({ url: image, caption: caption || "", submitted_at: new Date().toISOString() });
-    await writeMetafield(order_id, "customer_photos", JSON.stringify(existing), "json");
-    res.json({ success: true });
-  } catch (err) {
-    console.error("❌ Error in POST /customer-photo:", err);
-    res.status(500).json({ error: "Server error" });
-  }
+// POST /customer-photo
+app.post("/customer-photo", async (req, res) => {
+  const { order_id, token, photo_url } = req.body;
+  const qc = await getOrderMetafields(order_id);
+  if (qc.token !== token) return res.status(401).json({ error: "Invalid token" });
+  const photos = JSON.parse(qc.customer_photos || "[]");
+  photos.push(photo_url);
+  await updateMetafield(order_id, "customer_photos", JSON.stringify(photos));
+  await updateMetafield(order_id, "flow_trigger", "customer_photo");
+  res.json({ success: true });
 });
 
-app.get("/", (req, res) => res.json({ status: "SRR KKC Proxy live 🔥" }));
-
-app.listen(PORT, () => console.log(`🔥 SRR-KKC Proxy running on port ${PORT}`));
+app.listen(PORT, () => console.log(`SRR KKC Proxy running on port ${PORT}`));
