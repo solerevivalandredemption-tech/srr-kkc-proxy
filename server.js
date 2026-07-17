@@ -116,5 +116,24 @@ app.post("/customer-photo", async (req, res) => {
   await updateMetafield(order_id, "flow_trigger", "customer_photo");
   res.json({ success: true });
 });
+app.get("/auth", (req, res) => {
+  const url = `https://solerevivalandredemption.myshopify.com/admin/oauth/authorize?client_id=4a93dd1fdf9d78c2bdf85d891070dc1b&scope=read_orders,write_orders,read_metafields,write_metafields&redirect_uri=https://srr-kkc-proxy.onrender.com/auth/callback`;
+  res.redirect(url);
+});
+
+app.get("/auth/callback", async (req, res) => {
+  const { code } = req.query;
+  const response = await fetch(`https://solerevivalandredemption.myshopify.com/admin/oauth/access_token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_id: "4a93dd1fdf9d78c2bdf85d891070dc1b",
+      client_secret: "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",
+      code
+    })
+  });
+  const data = await response.json();
+  res.send(`<h1>TOKEN: ${data.access_token}</h1>`);
+});
 
 app.listen(PORT, () => console.log(`SRR KKC Proxy running on port ${PORT}`));
